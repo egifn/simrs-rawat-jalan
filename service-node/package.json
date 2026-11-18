@@ -1,0 +1,17 @@
+{
+  "name": "simrs-service-node",
+  "version": "1.0.0",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.3",
+    "joi": "^17.13.9",
+    "jsonwebtoken": "^9.0.3",
+    "pdfkit": "^0.15.2",
+    "pg": "^8.23.1"
+  }
+}
