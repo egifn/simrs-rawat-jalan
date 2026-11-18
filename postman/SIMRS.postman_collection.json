@@ -1,0 +1,59 @@
+{
+	"info": {
+		"_postman_id": "aeff577b-8f58-40b0-8bb8-1be29ec4c8b4",
+		"name": "SIMRS",
+		"schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json",
+		"_exporter_id": "43216849",
+		"_collection_link": "https://red-water-810749.postman.co/workspace/Team-Workspace~f0014406-4638-4411-8d96-edbb121291db/collection/43216849-aeff577b-8f58-40b0-8bb8-1be29ec4c8b4?action=share&source=collection_link&creator=43216849"
+	},
+	"item": [
+		{
+			"name": "Pemeriksaan",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		},
+		{
+			"name": "Auth - Login",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		},
+		{
+			"name": "Kunjungan",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		},
+		{
+			"name": "Antrean",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		},
+		{
+			"name": "Bayar",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		},
+		{
+			"name": "Kunjungan POST",
+			"request": {
+				"method": "GET",
+				"header": []
+			},
+			"response": []
+		}
+	]
+}
