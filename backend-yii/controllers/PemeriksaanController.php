@@ -7,6 +7,7 @@ use yii\web\BadRequestHttpException;
 use yii\web\NotFoundHttpException;
 use yii\web\ConflictHttpException;
 use app\components\ApiController;
+use app\components\LabOutboxDispatcher;
 use app\models\Kunjungan;
 use app\models\MasterDokter;
 use app\models\MasterTindakan;
@@ -36,12 +37,28 @@ class PemeriksaanController extends ApiController
 
         $user = Yii::$app->user->identity;
         $dokter = MasterDokter::findOne(['user_id' => $user->id]) ?? MasterDokter::findOne($kunjungan->dokter_id);
+        if (!$dokter) {
+            throw new NotFoundHttpException('Data dokter tidak ditemukan.');
+        }
         $data = Yii::$app->request->post();
 
         $transaction = Yii::$app->db->beginTransaction();
         try {
-            // 1. Simpan / Update Rekam Medis Elektronik
-            $rm = RekamMedis::findOne(['kunjungan_id' => $kunjungan->id]) ?? new RekamMedis();
+            $billing = Billing::findBySql(
+                'SELECT * FROM {{%billing}} WHERE kunjungan_id = :kunjungan_id FOR UPDATE',
+                [':kunjungan_id' => $kunjungan->id]
+            )->one();
+            if (!$billing) {
+                throw new NotFoundHttpException('Tagihan kunjungan tidak ditemukan.');
+            }
+            if ((float) $billing->total_dibayar > 0 || $billing->status_pembayaran === 'LUNAS') {
+                throw new ConflictHttpException('Pemeriksaan tidak dapat diubah setelah pembayaran tercatat. Ajukan koreksi melalui prosedur kasir.');
+            }
+            if (RekamMedis::find()->where(['kunjungan_id' => $kunjungan->id])->exists()) {
+                throw new ConflictHttpException('Pemeriksaan sudah tersimpan. Gunakan fitur revisi agar perubahan tercatat di audit.');
+            }
+
+            $rm = new RekamMedis();
             $rm->kunjungan_id = $kunjungan->id;
             $rm->dokter_id = $dokter->id;
             $rm->anamnesis = $data['anamnesis'] ?? '';
@@ -57,16 +74,17 @@ class PemeriksaanController extends ApiController
                 throw new BadRequestHttpException(json_encode($rm->errors));
             }
 
-            // 2. Simpan Tindakan Medis (jika ada)
             $totalBiayaTindakan = 0;
             if (!empty($data['tindakan']) && is_array($data['tindakan'])) {
-                KunjunganTindakan::deleteAll(['kunjungan_id' => $kunjungan->id]);
                 foreach ($data['tindakan'] as $item) {
                     $masterTindakan = MasterTindakan::findOne(['id' => $item['tindakan_id'], 'kategori' => 'MEDIS']);
                     if (!$masterTindakan) {
                         throw new BadRequestHttpException("Tindakan medis ID {$item['tindakan_id']} tidak valid.");
                     }
                     $qty = (int)($item['jumlah'] ?? 1);
+                    if ($qty < 1) {
+                        throw new BadRequestHttpException('Jumlah tindakan harus lebih besar dari 0.');
+                    }
                     $subtotal = $masterTindakan->tarif * $qty;
                     $totalBiayaTindakan += $subtotal;
 
@@ -77,13 +95,15 @@ class PemeriksaanController extends ApiController
                     $kt->tarif_saat_itu = $masterTindakan->tarif;
                     $kt->subtotal = $subtotal;
                     $kt->catatan = $item['catatan'] ?? null;
-                    $kt->save(false);
+                    if (!$kt->save()) {
+                        throw new BadRequestHttpException(json_encode($kt->errors));
+                    }
                 }
             }
 
-            // 3. Simpan Permintaan Pemeriksaan Penunjang / Lab (jika ada)
             $totalBiayaLab = 0;
             $labOrders = [];
+            $outboxIds = [];
             if (!empty($data['permintaan_lab']) && is_array($data['permintaan_lab'])) {
                 foreach ($data['permintaan_lab'] as $labItem) {
                     $masterLab = MasterTindakan::findOne(['id' => $labItem['tindakan_id'], 'kategori' => 'LABORATORIUM']);
@@ -93,18 +113,30 @@ class PemeriksaanController extends ApiController
                     $totalBiayaLab += $masterLab->tarif;
 
                     $order = new PermintaanLab();
-                    $order->no_order_lab = 'LAB-' . date('Ymd') . '-' . strtoupper(substr(uniqid(), -5));
+                    $order->no_order_lab = 'LAB-' . date('Ymd') . '-' . strtoupper(Yii::$app->security->generateRandomString(10));
                     $order->kunjungan_id = $kunjungan->id;
                     $order->dokter_id = $dokter->id;
                     $order->tindakan_id = $masterLab->id;
                     $order->catatan_klinis = $labItem['catatan_klinis'] ?? null;
-                    $order->status_lab = 'DIMINTA';
-                    $order->save(false);
+                    $order->status_lab = 'PENDING_SYNC';
+                    if (!$order->save()) {
+                        throw new BadRequestHttpException(json_encode($order->errors));
+                    }
+                    $payload = [
+                        'order_id' => (int) $order->id,
+                        'no_order_lab' => $order->no_order_lab,
+                        'kunjungan_id' => (int) $kunjungan->id,
+                    ];
+                    Yii::$app->db->createCommand()->insert('{{%lab_integration_outbox}}', [
+                        'lab_order_id' => $order->id,
+                        'payload' => json_encode($payload),
+                        'status' => 'PENDING',
+                    ])->execute();
                     $labOrders[] = $order;
+                    $outboxIds[] = Yii::$app->db->getLastInsertID();
                 }
             }
 
-            // 4. Simpan Resep Obat & Validasi Ketersediaan Stok Awal (jika ada)
             $totalBiayaObat = 0;
             if (!empty($data['resep']) && is_array($data['resep'])) {
                 $resep = Resep::findOne(['kunjungan_id' => $kunjungan->id]) ?? new Resep();
@@ -113,20 +145,30 @@ class PemeriksaanController extends ApiController
                     $resep->kunjungan_id = $kunjungan->id;
                     $resep->dokter_id = $dokter->id;
                     $resep->status_resep = 'MENUNGGU';
-                    $resep->save(false);
-                } else {
-                    ResepDetail::deleteAll(['resep_id' => $resep->id]);
+                    if (!$resep->save()) {
+                        throw new BadRequestHttpException(json_encode($resep->errors));
+                    }
+                }
+
+                $requestedQuantities = [];
+                foreach ($data['resep'] as $obatItem) {
+                    $obatId = filter_var($obatItem['obat_id'] ?? null, FILTER_VALIDATE_INT);
+                    $qty = filter_var($obatItem['jumlah'] ?? 1, FILTER_VALIDATE_INT);
+                    if ($obatId === false || $qty === false || $qty < 1) {
+                        throw new BadRequestHttpException('Obat dan jumlah resep harus valid.');
+                    }
+                    $requestedQuantities[$obatId] = ($requestedQuantities[$obatId] ?? 0) + $qty;
+                }
+                foreach ($requestedQuantities as $obatId => $qty) {
+                    $obat = MasterObat::findOne($obatId);
+                    if (!$obat || (int) $obat->stok < $qty) {
+                        throw new BadRequestHttpException("Stok obat ID {$obatId} tidak mencukupi untuk jumlah resep.");
+                    }
                 }
 
                 foreach ($data['resep'] as $obatItem) {
                     $obat = MasterObat::findOne($obatItem['obat_id']);
-                    if (!$obat) {
-                        throw new BadRequestHttpException("Obat ID {$obatItem['obat_id']} tidak ditemukan.");
-                    }
                     $qty = (int)($obatItem['jumlah'] ?? 1);
-                    if ($obat->stok < $qty) {
-                        throw new BadRequestHttpException("Stok obat '{$obat->nama_obat}' tidak mencukupi (tersisa: {$obat->stok}).");
-                    }
 
                     $subtotalObat = $obat->harga_satuan * $qty;
                     $totalBiayaObat += $subtotalObat;
@@ -139,38 +181,43 @@ class PemeriksaanController extends ApiController
                     $detail->jumlah = $qty;
                     $detail->harga_saat_itu = $obat->harga_satuan;
                     $detail->subtotal = $subtotalObat;
-                    $detail->save(false);
+                    if (!$detail->save()) {
+                        throw new BadRequestHttpException(json_encode($detail->errors));
+                    }
                 }
                 $kunjungan->status_antrean = 'MENUNGGU_OBAT';
             } else {
                 $kunjungan->status_antrean = 'DIPERIKSA';
-                $kunjungan->save(false);
             }
 
-            $kunjungan->save(false);
+            if (!$kunjungan->save(false)) {
+                throw new \RuntimeException('Status antrean gagal disimpan.');
+            }
 
-            // 5. Kalkulasi Otomatis Komponen Billing Pasien
-            $billing = Billing::findOne(['kunjungan_id' => $kunjungan->id]);
-            if ($billing) {
-                $billing->biaya_tindakan = $totalBiayaTindakan;
-                $billing->biaya_lab = $totalBiayaLab;
-                $billing->biaya_obat = $totalBiayaObat;
-                $billing->total_tagihan = $billing->biaya_pendaftaran + $totalBiayaTindakan + $totalBiayaLab + $totalBiayaObat;
-                $billing->updated_at = date('Y-m-d H:i:s');
-                $billing->save(false);
+            $billing->biaya_tindakan = $totalBiayaTindakan;
+            $billing->biaya_lab = $totalBiayaLab;
+            $billing->biaya_obat = $totalBiayaObat;
+            $billing->total_tagihan = $billing->biaya_pendaftaran + $totalBiayaTindakan + $totalBiayaLab + $totalBiayaObat;
+            $billing->updated_at = date('Y-m-d H:i:s');
+            if (!$billing->save(false)) {
+                throw new \RuntimeException('Tagihan pemeriksaan gagal diperbarui.');
             }
 
             $transaction->commit();
 
-            // 6. SKENARIO 5 (Gangguan Integrasi): Kirim notifikasi order lab ke Node.js Service secara non-blocking / fallback
-            foreach ($labOrders as $order) {
-                $this->notifyNodeLabService($order);
+            $pendingSync = [];
+            $outbox = new LabOutboxDispatcher();
+            foreach ($outboxIds as $index => $outboxId) {
+                if (!$outbox->dispatch($outboxId)) {
+                    $pendingSync[] = $labOrders[$index]->id;
+                }
             }
 
             return [
                 'rekam_medis' => $rm,
                 'billing' => $billing,
                 'permintaan_lab' => $labOrders,
+                'pending_sync_lab_ids' => $pendingSync,
             ];
         } catch (\Throwable $e) {
             $transaction->rollBack();
@@ -184,38 +231,75 @@ class PemeriksaanController extends ApiController
      */
     public function actionRevisi($kunjungan_id)
     {
-        $billing = Billing::findOne(['kunjungan_id' => $kunjungan_id]);
-        if ($billing && $billing->status_pembayaran === 'LUNAS') {
-            throw new ConflictHttpException('Tagihan sudah LUNAS. Perubahan medis terkunci dan memerlukan pembatalan kwitansi oleh Kasir/Admin.');
-        }
-
-        $rm = RekamMedis::findOne(['kunjungan_id' => $kunjungan_id]);
-        if (!$rm) {
-            throw new NotFoundHttpException('Rekam medis belum ada untuk kunjungan ini.');
-        }
-
         $data = Yii::$app->request->post();
-        $oldData = [
-            'diagnosis_utama' => $rm->diagnosis_utama,
-            'diagnosis_sekunder' => $rm->diagnosis_sekunder,
-            'biaya_tindakan_lama' => $billing ? $billing->biaya_tindakan : 0,
-        ];
+        $reason = trim((string) ($data['alasan_revisi'] ?? ''));
+        if ($reason === '') {
+            throw new BadRequestHttpException('Alasan revisi wajib diisi untuk audit rekam medis.');
+        }
+        if (!isset($data['diagnosis_utama']) && !isset($data['diagnosis_sekunder']) && !array_key_exists('tindakan', $data)) {
+            throw new BadRequestHttpException('Tidak ada data pemeriksaan yang akan direvisi.');
+        }
 
         $transaction = Yii::$app->db->beginTransaction();
         try {
-            if (isset($data['diagnosis_utama'])) $rm->diagnosis_utama = $data['diagnosis_utama'];
-            if (isset($data['diagnosis_sekunder'])) $rm->diagnosis_sekunder = $data['diagnosis_sekunder'];
-            $rm->updated_at = date('Y-m-d H:i:s');
-            $rm->save(false);
+            $billing = Billing::findBySql(
+                'SELECT * FROM {{%billing}} WHERE kunjungan_id = :kunjungan_id FOR UPDATE',
+                [':kunjungan_id' => $kunjungan_id]
+            )->one();
+            if (!$billing) {
+                throw new NotFoundHttpException('Tagihan kunjungan tidak ditemukan.');
+            }
+            if ((float) $billing->total_dibayar > 0 || $billing->status_pembayaran === 'LUNAS') {
+                throw new ConflictHttpException('Revisi terkunci karena pembayaran sudah tercatat. Selesaikan koreksi pembayaran terlebih dahulu.');
+            }
 
-            $totalBiayaTindakan = $billing ? $billing->biaya_tindakan : 0;
-            if (isset($data['tindakan']) && is_array($data['tindakan'])) {
+            $rm = RekamMedis::findOne(['kunjungan_id' => $kunjungan_id]);
+            if (!$rm) {
+                throw new NotFoundHttpException('Rekam medis belum ada untuk kunjungan ini.');
+            }
+            $oldData = [
+                'rekam_medis' => [
+                    'diagnosis_utama' => $rm->diagnosis_utama,
+                    'diagnosis_sekunder' => $rm->diagnosis_sekunder,
+                ],
+                'tindakan' => KunjunganTindakan::find()
+                    ->where(['kunjungan_id' => $kunjungan_id])
+                    ->asArray()
+                    ->all(),
+                'billing' => [
+                    'biaya_tindakan' => $billing->biaya_tindakan,
+                    'total_tagihan' => $billing->total_tagihan,
+                    'total_dibayar' => $billing->total_dibayar,
+                ],
+            ];
+
+            if (isset($data['diagnosis_utama'])) {
+                $rm->diagnosis_utama = trim((string) $data['diagnosis_utama']);
+            }
+            if (array_key_exists('diagnosis_sekunder', $data)) {
+                $rm->diagnosis_sekunder = $data['diagnosis_sekunder'];
+            }
+            $rm->updated_at = date('Y-m-d H:i:s');
+            if (!$rm->save()) {
+                throw new BadRequestHttpException(json_encode($rm->errors));
+            }
+
+            $totalBiayaTindakan = (float) $billing->biaya_tindakan;
+            if (array_key_exists('tindakan', $data)) {
+                if (!is_array($data['tindakan'])) {
+                    throw new BadRequestHttpException('Daftar tindakan revisi tidak valid.');
+                }
                 $totalBiayaTindakan = 0;
                 KunjunganTindakan::deleteAll(['kunjungan_id' => $kunjungan_id]);
                 foreach ($data['tindakan'] as $item) {
                     $masterTindakan = MasterTindakan::findOne(['id' => $item['tindakan_id'], 'kategori' => 'MEDIS']);
-                    if (!$masterTindakan) continue;
-                    $qty = (int)($item['jumlah'] ?? 1);
+                    if (!$masterTindakan) {
+                        throw new BadRequestHttpException('Tindakan revisi tidak valid.');
+                    }
+                    $qty = filter_var($item['jumlah'] ?? 1, FILTER_VALIDATE_INT);
+                    if ($qty === false || $qty < 1) {
+                        throw new BadRequestHttpException('Jumlah tindakan harus lebih besar dari 0.');
+                    }
                     $subtotal = $masterTindakan->tarif * $qty;
                     $totalBiayaTindakan += $subtotal;
 
@@ -225,30 +309,41 @@ class PemeriksaanController extends ApiController
                     $kt->jumlah = $qty;
                     $kt->tarif_saat_itu = $masterTindakan->tarif;
                     $kt->subtotal = $subtotal;
-                    $kt->save(false);
-                }
-
-                if ($billing) {
-                    $billing->biaya_tindakan = $totalBiayaTindakan;
-                    $billing->total_tagihan = $billing->biaya_pendaftaran + $totalBiayaTindakan + $billing->biaya_lab + $billing->biaya_obat;
-                    $billing->updated_at = date('Y-m-d H:i:s');
-                    $billing->save(false);
+                    if (!$kt->save()) {
+                        throw new BadRequestHttpException(json_encode($kt->errors));
+                    }
                 }
             }
 
-            // Catat riwayat perubahan ke tabel audit_logs (JSONB)
-            Yii::$app->db->createCommand()->insert('audit_logs', [
+            $billing->biaya_tindakan = $totalBiayaTindakan;
+            $billing->total_tagihan = $billing->biaya_pendaftaran + $totalBiayaTindakan + $billing->biaya_lab + $billing->biaya_obat;
+            $billing->updated_at = date('Y-m-d H:i:s');
+            if (!$billing->save(false)) {
+                throw new \RuntimeException('Total tagihan gagal disinkronkan dengan revisi pemeriksaan.');
+            }
+
+            Yii::$app->db->createCommand()->insert('{{%audit_logs}}', [
                 'table_name' => 'rekam_medis_dan_tindakan',
                 'record_id' => $rm->id,
                 'action' => 'REVISION',
                 'old_data' => json_encode($oldData),
                 'new_data' => json_encode([
-                    'diagnosis_utama' => $rm->diagnosis_utama,
-                    'diagnosis_sekunder' => $rm->diagnosis_sekunder,
-                    'biaya_tindakan_baru' => $totalBiayaTindakan,
+                    'rekam_medis' => [
+                        'diagnosis_utama' => $rm->diagnosis_utama,
+                        'diagnosis_sekunder' => $rm->diagnosis_sekunder,
+                    ],
+                    'tindakan' => KunjunganTindakan::find()
+                        ->where(['kunjungan_id' => $kunjungan_id])
+                        ->asArray()
+                        ->all(),
+                    'billing' => [
+                        'biaya_tindakan' => $billing->biaya_tindakan,
+                        'total_tagihan' => $billing->total_tagihan,
+                        'total_dibayar' => $billing->total_dibayar,
+                    ],
                 ]),
                 'changed_by' => Yii::$app->user->id,
-                'reason' => $data['alasan_revisi'] ?? 'Koreksi klinis oleh dokter',
+                'reason' => $reason,
             ])->execute();
 
             $transaction->commit();
@@ -259,28 +354,4 @@ class PemeriksaanController extends ApiController
         }
     }
 
-    private function notifyNodeLabService(PermintaanLab $order): void
-    {
-        try {
-            $ch = curl_init('http://localhost:3001/api/lab/webhook-order');
-            curl_setopt_array($ch, [
-                CURLOPT_POST => true,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-                CURLOPT_POSTFIELDS => json_encode(['order_id' => $order->id, 'no_order_lab' => $order->no_order_lab]),
-                CURLOPT_TIMEOUT_MS => 800, // Timeout cepat agar tidak menghambat dokter
-            ]);
-            curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-
-            if ($httpCode < 200 || $httpCode >= 300) {
-                throw new \Exception('Node.js Lab Service tidak merespons');
-            }
-        } catch (\Throwable $e) {
-            // SKENARIO 5: Jika service Node.js mati, tandai PENDING_SYNC tanpa membatalkan pemeriksaan dokter!
-            $order->status_lab = 'PENDING_SYNC';
-            $order->save(false);
-        }
-    }
 }

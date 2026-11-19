@@ -7,6 +7,10 @@ const {
 
 const router = express.Router();
 
+const isIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value)
+  && !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+  && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+
 /**
  * GET /api/dashboard/summary?start_date=2026-01-01&end_date=2026-12-31
  */
@@ -16,8 +20,19 @@ router.get(
   authorizePermissions("dashboard", "laporan"),
   async (req, res, next) => {
   try {
-    const startDate = req.query.start_date || "2026-01-01";
-    const endDate = req.query.end_date || "2026-12-31";
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const startDate = req.query.start_date || `${today.slice(0, 7)}-01`;
+    const endDate = req.query.end_date || today;
+    if (!isIsoDate(startDate) || !isIsoDate(endDate) || startDate > endDate) {
+      return res.status(400).json({
+        success: false,
+        status_code: 400,
+        message: "Periode tanggal tidak valid.",
+        data: null,
+        errors: { name: "BadRequest" },
+      });
+    }
 
     // Jalankan 6 query agregasi secara paralel (Promise.all) untuk performa maksimal
     const [
@@ -70,11 +85,14 @@ router.get(
       // 5. Rekap penggunaan obat
       pool.query(
         `SELECT mo.kode_obat, mo.nama_obat, mo.satuan, mo.stok AS sisa_stok,
-                COALESCE(SUM(rd.jumlah), 0)::int AS total_keluar
+                COALESCE(SUM(rd.jumlah) FILTER (
+                  WHERE r.status_resep = 'DISERAHKAN'
+                    AND k.tanggal_kunjungan BETWEEN $1 AND $2
+                ), 0)::int AS total_keluar
          FROM master_obat mo
          LEFT JOIN resep_detail rd ON rd.obat_id = mo.id
-         LEFT JOIN resep r ON rd.resep_id = r.id AND r.status_resep = 'DISERAHKAN'
-         LEFT JOIN kunjungan k ON r.kunjungan_id = k.id AND k.tanggal_kunjungan BETWEEN $1 AND $2
+         LEFT JOIN resep r ON rd.resep_id = r.id
+         LEFT JOIN kunjungan k ON r.kunjungan_id = k.id
          GROUP BY mo.id
          ORDER BY total_keluar DESC`,
         [startDate, endDate],

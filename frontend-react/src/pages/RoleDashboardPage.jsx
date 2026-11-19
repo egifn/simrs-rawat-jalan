@@ -48,7 +48,7 @@ export default function RoleDashboardPage({ role }) {
       try {
         let nextValues = {};
         if (role === 'PENDAFTARAN' || role === 'DOKTER') {
-          const response = await yiiApi.get('/kunjungan', { params: { tanggal: getToday() } });
+          const response = await yiiApi.get('/kunjungan', { params: { tanggal: getToday(), limit: 500 } });
           const visits = response.data.data;
           nextValues = {
             total: visits.length,
@@ -66,7 +66,7 @@ export default function RoleDashboardPage({ role }) {
           };
         } else if (role === 'FARMASI') {
           const [prescriptions, medicines] = await Promise.all([
-            yiiApi.get('/farmasi/antrean'),
+            yiiApi.get('/farmasi/antrean', { params: { limit: 100 } }),
             yiiApi.get('/obat'),
           ]);
           nextValues = {
@@ -75,7 +75,9 @@ export default function RoleDashboardPage({ role }) {
             lowStock: medicines.data.data.filter((medicine) => Number(medicine.stok) <= 5).length,
           };
         } else if (role === 'KASIR') {
-          const response = await yiiApi.get('/kunjungan');
+          const response = await yiiApi.get('/kunjungan', {
+            params: { tagihan_belum_lunas: 1, limit: 500 },
+          });
           const billings = response.data.data.map((visit) => visit.billing).filter(Boolean);
           nextValues = {
             unpaid: billings.filter((billing) => billing.status_pembayaran === 'BELUM_DIBAYAR').length,

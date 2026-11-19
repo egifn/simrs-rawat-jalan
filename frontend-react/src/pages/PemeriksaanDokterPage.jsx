@@ -21,11 +21,10 @@ export default function PemeriksaanDokterPage() {
   const [msg, setMsg] = useState({ type: '', text: '' });
 
   const loadData = async () => {
-    const [kRes, tRes, oRes, labRes] = await Promise.all([
-      yiiApi.get('/kunjungan'),
+    const [kRes, tRes, oRes] = await Promise.all([
+      yiiApi.get('/kunjungan', { params: { limit: 500 } }),
       yiiApi.get('/tindakan'),
       yiiApi.get('/obat'),
-      nodeApi.get('/lab/permintaan').catch(() => ({ data: { data: [] } })),
     ]);
     setKunjunganList(kRes.data.data);
     const antreanMenunggu = kRes.data.data.filter(
@@ -35,7 +34,16 @@ export default function PemeriksaanDokterPage() {
     setTindakanMaster(tRes.data.data.filter((t) => t.kategori === 'MEDIS'));
     setLabMaster(tRes.data.data.filter((t) => t.kategori === 'LABORATORIUM'));
     setObatMaster(oRes.data.data);
-    setHasilLabList(labRes.data.data || []);
+    try {
+      const labRes = await nodeApi.get('/lab/permintaan', { params: { limit: 100 } });
+      setHasilLabList(labRes.data.data || []);
+    } catch (error) {
+      setHasilLabList([]);
+      setMsg({
+        type: 'error',
+        text: error.response?.data?.message || 'Layanan laboratorium tidak tersedia. Pemeriksaan dapat disimpan; order lab akan tersinkronisasi dari antrean outbox.',
+      });
+    }
   };
 
   useEffect(() => { loadData(); }, []);
@@ -56,9 +64,14 @@ export default function PemeriksaanDokterPage() {
         })),
         resep: selectedObat ? [{ obat_id: Number(selectedObat), dosis: '500 mg', frekuensi: '3x1 sesudah makan', jumlah: Number(obatQty) }] : [],
       };
-      await yiiApi.post(`/pemeriksaan/${selectedKunjungan}`, payload);
-      
-      setMsg({ type: 'success', text: 'Pemeriksaan, Tindakan, Resep, & Billing berhasil disimpan!' });
+      const response = await yiiApi.post(`/pemeriksaan/${selectedKunjungan}`, payload);
+      const pendingLabIds = response.data.data.pending_sync_lab_ids || [];
+      setMsg({
+        type: pendingLabIds.length ? 'error' : 'success',
+        text: pendingLabIds.length
+          ? `Pemeriksaan, tindakan, resep, dan billing tersimpan. Order lab ${pendingLabIds.join(', ')} menunggu sinkronisasi; data aman di antrean retry.`
+          : 'Pemeriksaan, Tindakan, Resep, & Billing berhasil disimpan!',
+      });
 
       // Reset seluruh form kembali ke kondisi awal setelah berhasil disimpan
       setSelectedKunjungan('');

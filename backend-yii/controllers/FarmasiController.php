@@ -23,9 +23,18 @@ class FarmasiController extends ApiController
      */
     public function actionAntrean()
     {
-        return Resep::find()
-            ->with(['details.obat', 'kunjungan.pasien', 'kunjungan.dokter', 'kunjungan.billing'])
+        $query = Resep::find()
+            ->with(['details.obat', 'kunjungan.pasien', 'kunjungan.dokter', 'kunjungan.billing']);
+        if ($status = Yii::$app->request->get('status')) {
+            $query->andWhere(['status_resep' => strtoupper($status)]);
+        }
+
+        $limit = filter_var(Yii::$app->request->get('limit', 100), FILTER_VALIDATE_INT);
+        $offset = filter_var(Yii::$app->request->get('offset', 0), FILTER_VALIDATE_INT);
+        return $query
             ->orderBy(['created_at' => SORT_DESC])
+            ->limit($limit === false ? 100 : max(1, min(500, $limit)))
+            ->offset($offset === false ? 0 : max(0, $offset))
             ->asArray()
             ->all();
     }
@@ -63,40 +72,47 @@ class FarmasiController extends ApiController
                 throw new BadRequestHttpException('Detail item obat pada resep kosong.');
             }
 
-            // Urutkan berdasarkan obat_id untuk mencegah Deadlock
-            usort($details, fn($a, $b) => $a->obat_id <=> $b->obat_id);
-
+            $quantitiesByMedicine = [];
             foreach ($details as $item) {
-                // KUNCI BARIS OBAT DI POSTGRESQL (FOR UPDATE)
+                if ((int) $item->jumlah < 1) {
+                    throw new BadRequestHttpException('Jumlah obat pada resep harus lebih besar dari 0.');
+                }
+                $quantitiesByMedicine[$item->obat_id] = ($quantitiesByMedicine[$item->obat_id] ?? 0) + (int) $item->jumlah;
+            }
+            ksort($quantitiesByMedicine, SORT_NUMERIC);
+
+            foreach ($quantitiesByMedicine as $obatId => $quantity) {
                 $obatRow = Yii::$app->db->createCommand(
                     'SELECT id, nama_obat, stok FROM master_obat WHERE id = :id FOR UPDATE',
-                    [':id' => $item->obat_id]
+                    [':id' => $obatId]
                 )->queryOne();
 
                 if (!$obatRow) {
-                    throw new NotFoundHttpException("Data obat ID {$item->obat_id} tidak ditemukan.");
+                    throw new NotFoundHttpException("Data obat ID {$obatId} tidak ditemukan.");
                 }
 
-                if ((int)$obatRow['stok'] < (int)$item->jumlah) {
+                if ((int) $obatRow['stok'] < $quantity) {
                     throw new ConflictHttpException(
-                        "Konkurensi/Stok Habis: Stok obat '{$obatRow['nama_obat']}' tersisa {$obatRow['stok']}, dibutuhkan {$item->jumlah}."
+                        "Konkurensi/Stok Habis: Stok obat '{$obatRow['nama_obat']}' tersisa {$obatRow['stok']}, dibutuhkan {$quantity}."
                     );
                 }
 
-                // Kurangi stok secara atomik
                 Yii::$app->db->createCommand(
                     'UPDATE master_obat SET stok = stok - :qty, updated_at = NOW() WHERE id = :id',
-                    [':qty' => $item->jumlah, ':id' => $item->obat_id]
+                    [':qty' => $quantity, ':id' => $obatId]
                 )->execute();
             }
 
             $resep->status_resep = 'DISERAHKAN';
             $resep->diproses_oleh = Yii::$app->user->id;
             $resep->waktu_penyerahan = date('Y-m-d H:i:s');
-            $resep->save(false);
+            if (!$resep->save(false)) {
+                throw new \RuntimeException('Status penyerahan resep gagal disimpan.');
+            }
 
-            // Update status kunjungan menjadi SELESAI
-            Kunjungan::updateAll(['status_antrean' => 'SELESAI'], ['id' => $resep->kunjungan_id]);
+            if (Kunjungan::updateAll(['status_antrean' => 'SELESAI'], ['id' => $resep->kunjungan_id]) !== 1) {
+                throw new \RuntimeException('Status kunjungan gagal diperbarui setelah penyerahan obat.');
+            }
 
             $transaction->commit();
 

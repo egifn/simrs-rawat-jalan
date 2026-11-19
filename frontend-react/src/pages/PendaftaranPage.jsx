@@ -49,7 +49,7 @@ export default function PendaftaranPage() {
       const [poliRes, dokRes, kunjRes] = await Promise.all([
         yiiApi.get('/poli'),
         yiiApi.get('/dokter'),
-        yiiApi.get('/kunjungan', { params: { tanggal: todayStr } }),
+        yiiApi.get('/kunjungan', { params: { tanggal: todayStr, limit: 500 } }),
       ]);
       setPoliList(poliRes.data.data);
       setDokterList(dokRes.data.data);
@@ -105,7 +105,7 @@ export default function PendaftaranPage() {
     const loadRiwayat = async () => {
       try {
         const response = await yiiApi.get('/kunjungan', {
-          params: { pasien_id: pasienId },
+          params: { pasien_id: pasienId, limit: 100 },
           signal: controller.signal,
         });
         setRiwayatKunjungan(response.data.data);

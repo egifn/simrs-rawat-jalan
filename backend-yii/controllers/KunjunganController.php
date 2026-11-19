@@ -13,6 +13,7 @@ use app\models\MasterPoli;
 use app\models\MasterDokter;
 use app\models\MasterPasien;
 use app\models\JadwalDokter;
+use app\models\Billing;
 
 class KunjunganController extends ApiController
 {
@@ -42,8 +43,40 @@ class KunjunganController extends ApiController
             if ($pasienId = $request->get('pasien_id')) {
                 $query->andWhere(['pasien_id' => $pasienId]);
             }
+            if ($request->get('tagihan_belum_lunas')) {
+                $query->andWhere([
+                    'in',
+                    'id',
+                    Billing::find()
+                        ->select('kunjungan_id')
+                        ->andWhere(['<>', 'status_pembayaran', 'LUNAS']),
+                ])->andWhere(['<>', 'status_antrean', 'BATAL']);
+            }
 
-            return $query->asArray()->all();
+            if ($request->get('paginated')) {
+                $pageSize = filter_var($request->get('page_size', 50), FILTER_VALIDATE_INT);
+                $page = filter_var($request->get('page', 1), FILTER_VALIDATE_INT);
+                $pageSize = $pageSize === false ? 50 : max(1, min(200, $pageSize));
+                $page = $page === false ? 1 : max(1, $page);
+                $total = (int) (clone $query)->count();
+
+                return [
+                    'items' => $query
+                        ->limit($pageSize)
+                        ->offset(($page - 1) * $pageSize)
+                        ->asArray()
+                        ->all(),
+                    'total' => $total,
+                    'page' => $page,
+                    'page_size' => $pageSize,
+                ];
+            }
+
+            $limit = filter_var($request->get('limit', 200), FILTER_VALIDATE_INT);
+            $offset = filter_var($request->get('offset', 0), FILTER_VALIDATE_INT);
+            $limit = $limit === false ? 200 : max(1, min(500, $limit));
+            $offset = $offset === false ? 0 : max(0, $offset);
+            return $query->limit($limit)->offset($offset)->asArray()->all();
         }
 
         // POST: Daftarkan kunjungan jika role memiliki permission pendaftaran.

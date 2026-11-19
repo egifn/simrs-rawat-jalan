@@ -1,31 +1,52 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { yiiApi, nodeApi } from '../services/api';
-import { Receipt, Printer } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Receipt, Printer } from 'lucide-react';
 
 export default function KasirBillingPage() {
   const [kunjunganList, setKunjunganList] = useState([]);
+  const [totalTagihan, setTotalTagihan] = useState(0);
+  const [tagihanPage, setTagihanPage] = useState(1);
   const [selectedKunjunganId, setSelectedKunjunganId] = useState('');
   const [billingDetail, setBillingDetail] = useState(null);
   const [jumlahBayar, setJumlahBayar] = useState('');
   const [metode, setMetode] = useState('TUNAI');
   const [msg, setMsg] = useState('');
   const [savingPayment, setSavingPayment] = useState(false);
-  const idempotencyRef = useRef(null);
   const kunjunganDipilih = kunjunganList.find((kunjungan) => String(kunjungan.id) === selectedKunjunganId);
   const sudahDiperiksa = Boolean(kunjunganDipilih?.rekamMedis);
 
   // Tagihan tetap ditampilkan sampai lunas, meskipun pelayanan pasien sudah selesai.
-  const loadKunjunganBelumBayar = async () => {
-    const res = await yiiApi.get('/kunjungan');
-    const belumLunas = res.data.data.filter(
-      (k) => k.status_antrean !== 'BATAL' && k.billing?.status_pembayaran !== 'LUNAS'
-    );
-    setKunjunganList(belumLunas);
+  const loadKunjunganBelumBayar = useCallback(async (page = 1) => {
+    let data;
+    let requestedPage = page;
+    do {
+      const res = await yiiApi.get('/kunjungan', {
+        params: {
+          tagihan_belum_lunas: 1,
+          paginated: 1,
+          page: requestedPage,
+          page_size: 50,
+        },
+      });
+      data = res.data.data;
+      if (data.items.length > 0 || requestedPage <= 1) break;
+      requestedPage -= 1;
+    } while (requestedPage > 0);
+
+    setKunjunganList(data.items);
+    setTotalTagihan(data.total);
+    setTagihanPage(data.page);
+  }, []);
+
+  const changeBillPage = (page) => {
+    setSelectedKunjunganId('');
+    setBillingDetail(null);
+    loadKunjunganBelumBayar(page);
   };
 
   useEffect(() => {
-    loadKunjunganBelumBayar();
-  }, []);
+    loadKunjunganBelumBayar(1);
+  }, [loadKunjunganBelumBayar]);
 
   const loadBilling = async (kId) => {
     setSelectedKunjunganId(kId);
@@ -50,8 +71,23 @@ export default function KasirBillingPage() {
     e.preventDefault();
     const b = billingDetail.billing;
     if (savingPayment) return;
-    if (!idempotencyRef.current || idempotencyRef.current.billingId !== b.id) {
-      idempotencyRef.current = { billingId: b.id, key: crypto.randomUUID() };
+    const request = {
+      metode: metode,
+      jumlah: Number(jumlahBayar).toFixed(2),
+    };
+    const storageKey = `simrs_payment_request_${b.id}`;
+    let pendingRequest;
+    try {
+      pendingRequest = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    } catch {
+      pendingRequest = null;
+    }
+    if (!pendingRequest || pendingRequest.metode !== request.metode || pendingRequest.jumlah !== request.jumlah) {
+      pendingRequest = {
+        ...request,
+        key: crypto.randomUUID(),
+      };
+      localStorage.setItem(storageKey, JSON.stringify(pendingRequest));
     }
 
     setSavingPayment(true);
@@ -59,7 +95,7 @@ export default function KasirBillingPage() {
       let response;
       try {
         response = await yiiApi.post(`/billing/bayar/${b.id}`, {
-          idempotency_key: idempotencyRef.current.key,
+          idempotency_key: pendingRequest.key,
           metode_pembayaran: metode,
           jumlah_bayar: Number(jumlahBayar),
         });
@@ -69,13 +105,13 @@ export default function KasirBillingPage() {
       }
 
       const billingTerbaru = response.data.data.billing;
-      idempotencyRef.current = null;
+      localStorage.removeItem(storageKey);
       setMsg(response.data.data.message);
       setBillingDetail((current) => ({ ...current, billing: billingTerbaru }));
       setJumlahBayar(Number(billingTerbaru.total_tagihan) - Number(billingTerbaru.total_dibayar));
 
       try {
-        await loadKunjunganBelumBayar();
+        await loadKunjunganBelumBayar(tagihanPage);
       } catch {
         setMsg('Pembayaran berhasil dicatat, tetapi daftar tagihan gagal diperbarui.');
       }
@@ -106,13 +142,36 @@ export default function KasirBillingPage() {
           className="w-full border rounded-lg p-2.5 text-sm"
           disabled={savingPayment}
         >
-          <option value="">-- Pilih Pasien Belum Bayar ({kunjunganList.length} Antrean Tagihan) --</option>
+          <option value="">-- Pilih Pasien Belum Bayar ({totalTagihan} Antrean Tagihan) --</option>
           {kunjunganList.map((k) => (
             <option key={k.id} value={k.id}>
               {k.no_registrasi} — {k.pasien?.nama_lengkap} ({k.poli?.nama_poli}){k.rekamMedis ? '' : ' — Belum diperiksa'}
             </option>
           ))}
         </select>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <span className="text-xs text-slate-500">
+            Halaman {tagihanPage} dari {Math.max(1, Math.ceil(totalTagihan / 50))}
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => changeBillPage(tagihanPage - 1)}
+              disabled={tagihanPage <= 1}
+              className="flex items-center gap-1 rounded-lg border px-3 py-1.5 text-xs disabled:opacity-50"
+            >
+              <ChevronLeft size={14} /> Sebelumnya
+            </button>
+            <button
+              type="button"
+              onClick={() => changeBillPage(tagihanPage + 1)}
+              disabled={tagihanPage >= Math.ceil(totalTagihan / 50)}
+              className="flex items-center gap-1 rounded-lg border px-3 py-1.5 text-xs disabled:opacity-50"
+            >
+              Berikutnya <ChevronRight size={14} />
+            </button>
+          </div>
+        </div>
       </div>
 
       {billingDetail && (

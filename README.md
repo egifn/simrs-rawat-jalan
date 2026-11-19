@@ -35,15 +35,16 @@ Endpoint konfigurasi hak akses adalah `GET /api/admin/permissions` dan `PUT /api
 
 ## 4. Penanganan Edge Cases & Keamanan
 
-1. **Anti-Duplikasi Pendaftaran:** Yii mengunci baris pasien dan jadwal praktik dalam transaksi, memeriksa kunjungan aktif pada poli/tanggal yang sama, lalu membuat nomor antrean dan memeriksa kuota sebelum transaksi disimpan.
-2. **Race Condition Stok Obat:** Menggunakan transaksi database dengan _Pessimistic Locking_ (`SELECT ... FOR UPDATE`) serta constraint `stok >= 0`.
-3. **Anti-Double Payment:** Setiap transaksi kasir wajib menyertakan `idempotency_key` (UUID v4) unik.
-4. **Integritas Rekam Medis & Billing:** _Soft-lock_ mencegah perubahan tindakan/resep setelah tagihan berstatus `LUNAS`, serta mencatat log revisi ke tabel `audit_logs` (`JSONB`).
-5. **Resiliensi Layanan Penunjang:** Apabila `service-node` tidak aktif saat dokter mengirim permintaan lab, order tetap tersimpan aman di Yii2 dengan status `PENDING_SYNC` dan dapat disinkronkan ulang melalui endpoint `/api/lab/sync-pending`.
+1. **Anti-Duplikasi Pendaftaran:** Transaksi mengunci pasien dan jadwal (`SELECT ... FOR UPDATE`), memeriksa duplikasi serta kuota, dan memakai unique index antrean di PostgreSQL. Database tetap menjamin penolakan jika dua request balapan.
+2. **Race Condition Stok Obat:** Penyerahan mengunci resep dan baris obat secara berurutan berdasarkan ID, menjumlahkan baris obat duplikat, lalu mengurangi stok dalam transaksi. Check constraint PostgreSQL menolak stok negatif.
+3. **Anti-Double Payment:** Kasir memakai `idempotency_key` unik dan fingerprint request. Retry dengan key dan payload sama mengembalikan pembayaran yang sudah dibuat; key yang dipakai ulang dengan payload berbeda ditolak. Kunci disimpan di browser sampai server mengonfirmasi sukses.
+4. **Integritas Rekam Medis & Billing:** Revisi mengunci billing, menolak perubahan setelah pembayaran tercatat, mensinkronkan ulang total tindakan, dan mewajibkan alasan revisi. Snapshot diagnosis, tindakan, total billing, pengguna, dan waktu tersimpan di `audit_logs` (`JSONB`).
+5. **Resiliensi Layanan Penunjang:** Order lab dan event outbox dibuat dalam transaksi yang sama. Kegagalan Node.js meninggalkan order berstatus `PENDING_SYNC`; retry tercatat dan dapat dijalankan melalui `php yii lab-outbox/dispatch` (jadwalkan berkala). Webhook internal dilindungi `SIMRS_LAB_WEBHOOK_SECRET`, yang harus disetel dengan nilai rahasia yang sama di environment PHP dan Node.js. Endpoint `/api/lab/sync-pending` hanya menampilkan status sinkronisasi dan tidak mengubah status order secara palsu.
+6. **Performa:** Endpoint daftar master, kunjungan, resep, dan lab dibatasi dengan limit/offset; master memiliki pencarian dan pagination. Index komposit mendukung filter tanggal, pasien, status, dan relasi detail. Dashboard menjalankan agregasi paralel dengan periode tanggal tervalidasi.
 
 ## 5. Cara Menjalankan Proyek
 
-1. **Database:** Buat database `simrs_rawat_jalan` di PostgreSQL, lalu jalankan `database/schema.sql` dan `database/seed.sql`.
-2. **Backend Yii2:** Masuk ke `backend-yii/`, sesuaikan `config/db.php`, jalankan `php yii migrate --interactive=0` untuk membuat tabel hak akses dan permission awal, lalu jalankan `php yii serve --port=8000`.
-3. **Service Node.js:** Masuk ke `service-node/`, salin `.env`, jalankan `npm install` dan `npm start` (berjalan di port `3001`).
+1. **Database:** Buat database `simrs_rawat_jalan` di PostgreSQL dan jalankan `database/simrs_rawat_jalan.sql`.
+2. **Backend Yii2:** Masuk ke `backend-yii/`, sesuaikan `config/db.php`, jalankan `php yii migrate --interactive=0` untuk menerapkan migrasi permission, pasien aktif, idempotency, outbox, constraint stok, dan indeks, lalu jalankan `php yii serve --port=8000`.
+3. **Service Node.js:** Masuk ke `service-node/`, salin `.env`, set `SIMRS_LAB_WEBHOOK_SECRET` ke rahasia acak yang sama di environment PHP, lalu jalankan `npm install` dan `npm start` (berjalan di port `3001`). Konfigurasi `SIMRS_NODE_LAB_WEBHOOK_URL` pada environment PHP bila URL webhook berbeda dari alamat lokal default.
 4. **Frontend React:** Masuk ke `frontend-react/`, jalankan `npm install` dan `npm run dev`.

@@ -118,14 +118,56 @@ class AdminController extends ApiController
             $query->with('dokter');
         }
 
-        $query->orderBy(['id' => SORT_DESC]);
-        if ($resource !== 'pengguna') {
-            return $query->asArray()->all();
+        $page = max(1, (int) Yii::$app->request->get('page', 1));
+        $pageSize = (int) Yii::$app->request->get('page_size', 25);
+        $pageSize = min(100, max(1, $pageSize));
+        $search = trim((string) Yii::$app->request->get('q', ''));
+        if ($search !== '') {
+            $searchColumns = [
+                'pasien' => ['no_rm', 'nik', 'nama_lengkap'],
+                'dokter' => ['nip', 'nama_dokter', 'spesialisasi'],
+                'poli' => ['kode_poli', 'nama_poli'],
+                'jadwal' => ['hari'],
+                'tindakan' => ['kode_tindakan', 'nama_tindakan', 'kategori'],
+                'obat' => ['kode_obat', 'nama_obat'],
+                'pengguna' => ['username', 'nama_lengkap', 'role'],
+            ];
+            $columns = $searchColumns[$resource] ?? [];
+            $conditions = ['or'];
+            foreach ($columns as $column) {
+                $conditions[] = ['ilike', $column, $search];
+            }
+            if ($resource === 'jadwal') {
+                $conditions[] = [
+                    'in',
+                    'dokter_id',
+                    MasterDokter::find()
+                        ->select('id')
+                        ->andWhere(['ilike', 'nama_dokter', $search]),
+                ];
+            }
+            if (count($conditions) > 1) {
+                $query->andWhere($conditions);
+            }
         }
 
-        return array_map(static function ($model) {
-            return $model->toArray();
-        }, $query->all());
+        $query->orderBy(['id' => SORT_DESC]);
+        $total = (int) (clone $query)->count();
+        $query
+            ->limit($pageSize)
+            ->offset(($page - 1) * $pageSize);
+        $models = $resource === 'pengguna'
+            ? array_map(static function ($model) {
+                return $model->toArray();
+            }, $query->all())
+            : $query->asArray()->all();
+
+        return [
+            'items' => $models,
+            'total' => $total,
+            'page' => $page,
+            'page_size' => $pageSize,
+        ];
     }
 
     public function actionCreate($resource)

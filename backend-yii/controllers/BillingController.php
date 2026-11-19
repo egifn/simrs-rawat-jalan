@@ -3,6 +3,7 @@
 namespace app\controllers;
 
 use Yii;
+use yii\db\IntegrityException;
 use yii\web\NotFoundHttpException;
 use yii\web\BadRequestHttpException;
 use yii\web\ConflictHttpException;
@@ -58,35 +59,45 @@ class BillingController extends ApiController
     {
         $data = Yii::$app->request->post();
         $idempotencyKey = $data['idempotency_key'] ?? null;
-        $metode = strtoupper($data['metode_pembayaran'] ?? 'TUNAI');
-        $jumlahBayar = (float)($data['jumlah_bayar'] ?? 0);
+        $metode = strtoupper((string) ($data['metode_pembayaran'] ?? 'TUNAI'));
+        $rawJumlahBayar = $data['jumlah_bayar'] ?? null;
 
-        if (empty($idempotencyKey)) {
+        if (!is_string($idempotencyKey) || trim($idempotencyKey) === '' || strlen($idempotencyKey) > 255) {
             throw new BadRequestHttpException('Header/field idempotency_key (UUID) wajib disertakan untuk keamanan transaksi.');
         }
-
-        // 1. Cek Idempotency Key sebelum memproses transaksi: Jika sudah pernah diproses, kembalikan data yang sama!
-        $existingPayment = Pembayaran::findOne(['idempotency_key' => $idempotencyKey]);
-        if ($existingPayment) {
-            $billing = Billing::findOne($billing_id);
-            return [
-                'idempotent_replay' => true,
-                'message' => 'Transaksi dengan idempotency_key ini sudah tercatat sebelumnya (Mencegah pembayaran ganda).',
-                'pembayaran' => $existingPayment,
-                'billing' => $billing,
-            ];
+        $idempotencyKey = trim($idempotencyKey);
+        if (!is_numeric($rawJumlahBayar) || !is_finite((float) $rawJumlahBayar)) {
+            throw new BadRequestHttpException('Jumlah pembayaran tidak valid.');
         }
-
+        $jumlahBayar = round((float) $rawJumlahBayar, 2);
         if ($jumlahBayar <= 0) {
             throw new BadRequestHttpException('Jumlah pembayaran harus lebih dari 0.');
+        }
+        if (!in_array($metode, ['TUNAI', 'NON_TUNAI'], true)) {
+            throw new BadRequestHttpException('Metode pembayaran tidak valid.');
+        }
+
+        $requestHash = hash('sha256', json_encode([
+            'billing_id' => (int) $billing_id,
+            'metode_pembayaran' => $metode,
+            'jumlah_bayar' => number_format($jumlahBayar, 2, '.', ''),
+        ]));
+        $existingPayment = Pembayaran::findOne(['idempotency_key' => $idempotencyKey]);
+        if ($existingPayment) {
+            return $this->replayPayment($existingPayment, $billing_id, $requestHash, $metode, $jumlahBayar);
         }
 
         $transaction = Yii::$app->db->beginTransaction();
         try {
-            // Kunci baris billing selama proses pembayaran
             $billing = Billing::findBySql('SELECT * FROM billing WHERE id = :id FOR UPDATE', [':id' => $billing_id])->one();
             if (!$billing) {
                 throw new NotFoundHttpException('Tagihan tidak ditemukan.');
+            }
+
+            $existingPayment = Pembayaran::findOne(['idempotency_key' => $idempotencyKey]);
+            if ($existingPayment) {
+                $transaction->commit();
+                return $this->replayPayment($existingPayment, $billing_id, $requestHash, $metode, $jumlahBayar);
             }
 
             if (!RekamMedis::find()->where(['kunjungan_id' => $billing->kunjungan_id])->exists()) {
@@ -100,8 +111,9 @@ class BillingController extends ApiController
 
             $pembayaran = new Pembayaran();
             $pembayaran->billing_id = $billing->id;
-            $pembayaran->no_kwitansi = 'KWT-' . date('Ymd') . '-' . strtoupper(substr(uniqid(), -5));
+            $pembayaran->no_kwitansi = 'KWT-' . date('Ymd') . '-' . strtoupper(Yii::$app->security->generateRandomString(10));
             $pembayaran->idempotency_key = $idempotencyKey;
+            $pembayaran->request_hash = $requestHash;
             $pembayaran->metode_pembayaran = $metode;
             $pembayaran->jumlah_bayar = $jumlahBayar;
             $pembayaran->kasir_id = Yii::$app->user->id;
@@ -114,7 +126,9 @@ class BillingController extends ApiController
                 ? 'LUNAS'
                 : 'DIBAYAR_SEBAGIAN';
             $billing->updated_at = date('Y-m-d H:i:s');
-            $billing->save(false);
+            if (!$billing->save(false)) {
+                throw new \RuntimeException('Ringkasan tagihan gagal diperbarui.');
+            }
 
             if ($billing->status_pembayaran === 'LUNAS') {
                 $resep = Resep::findOne(['kunjungan_id' => $billing->kunjungan_id]);
@@ -134,9 +148,35 @@ class BillingController extends ApiController
                 'pembayaran' => $pembayaran,
                 'billing' => $billing,
             ];
+        } catch (IntegrityException $error) {
+            $transaction->rollBack();
+            $existingPayment = Pembayaran::findOne(['idempotency_key' => $idempotencyKey]);
+            if ($existingPayment) {
+                return $this->replayPayment($existingPayment, $billing_id, $requestHash, $metode, $jumlahBayar);
+            }
+            throw new ConflictHttpException('Transaksi pembayaran berkonflik. Silakan muat ulang tagihan dan coba kembali.');
         } catch (\Throwable $e) {
             $transaction->rollBack();
             throw $e;
         }
+    }
+
+    private function replayPayment(Pembayaran $payment, $billingId, $requestHash, $method, $amount)
+    {
+        $sameRequest = $payment->request_hash !== null
+            ? hash_equals($payment->request_hash, $requestHash)
+            : ((int) $payment->billing_id === (int) $billingId
+                && strtoupper($payment->metode_pembayaran) === $method
+                && number_format((float) $payment->jumlah_bayar, 2, '.', '') === number_format($amount, 2, '.', ''));
+        if ((int) $payment->billing_id !== (int) $billingId || !$sameRequest) {
+            throw new ConflictHttpException('Idempotency key sudah digunakan untuk transaksi dengan data berbeda.');
+        }
+
+        return [
+            'idempotent_replay' => true,
+            'message' => 'Transaksi pembayaran sudah tercatat. Data transaksi sebelumnya dikembalikan.',
+            'pembayaran' => $payment,
+            'billing' => Billing::findOne($billingId),
+        ];
     }
 }

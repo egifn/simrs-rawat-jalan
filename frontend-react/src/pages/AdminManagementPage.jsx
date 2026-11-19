@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { yiiApi } from '../services/api';
-import { Pencil, Plus, Save, ShieldCheck, Trash2, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Pencil, Plus, Save, Search, ShieldCheck, Trash2, X } from 'lucide-react';
 
 const roleOptions = [
   ['ADMIN', 'Administrator'],
@@ -103,12 +103,17 @@ const emptyForm = (resource) => Object.fromEntries(
 
 export default function AdminManagementPage({ resource }) {
   const [records, setRecords] = useState([]);
+  const [totalRecords, setTotalRecords] = useState(0);
   const [poliList, setPoliList] = useState([]);
   const [dokterList, setDokterList] = useState([]);
   const [form, setForm] = useState(() => emptyForm(resource));
   const [editingId, setEditingId] = useState(null);
+  const [formModalOpen, setFormModalOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [savingRole, setSavingRole] = useState('');
   const [permissionData, setPermissionData] = useState(null);
   const [message, setMessage] = useState({ type: '', text: '' });
@@ -116,7 +121,9 @@ export default function AdminManagementPage({ resource }) {
 
   const title = definition?.label || 'Hak Akses';
 
-  const loadData = useCallback(async () => {
+  const pageSize = 25;
+
+  const loadData = useCallback(async (requestedPage = page, requestedSearch = debouncedSearch) => {
     if (!definition && resource !== 'hak-akses') return;
     setLoading(true);
     try {
@@ -125,33 +132,75 @@ export default function AdminManagementPage({ resource }) {
         setPermissionData(data.data);
         return;
       }
-      const { data } = await yiiApi.get(`/admin/${resource}`);
-      setRecords(data.data);
-      if (resource === 'dokter' || resource === 'jadwal') {
-        const poliResponse = await yiiApi.get('/poli');
-        setPoliList(poliResponse.data.data);
-      }
-      if (resource === 'jadwal') {
-        const doctorResponse = await yiiApi.get('/dokter');
-        setDokterList(doctorResponse.data.data);
-      }
+      const { data } = await yiiApi.get(`/admin/${resource}`, {
+        params: {
+          page: requestedPage,
+          page_size: pageSize,
+          ...(requestedSearch ? { q: requestedSearch } : {}),
+        },
+      });
+      setRecords(data.data.items);
+      setTotalRecords(data.data.total);
     } catch (err) {
       setMessage({ type: 'error', text: err.response?.data?.message || 'Gagal memuat data administrator.' });
     } finally {
       setLoading(false);
     }
-  }, [definition, resource]);
+  }, [debouncedSearch, definition, page, pageSize, resource]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    const timeout = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(timeout);
+  }, [search]);
+
+  useEffect(() => {
+    if (resource !== 'dokter' && resource !== 'jadwal') return undefined;
+    let active = true;
+    const requests = [yiiApi.get('/poli')];
+    if (resource === 'jadwal') requests.push(yiiApi.get('/dokter'));
+
+    Promise.all(requests)
+      .then(([poliResponse, doctorResponse]) => {
+        if (!active) return;
+        setPoliList(poliResponse.data.data);
+        if (doctorResponse) setDokterList(doctorResponse.data.data);
+      })
+      .catch((err) => {
+        if (active) {
+          setMessage({ type: 'error', text: err.response?.data?.message || 'Gagal memuat pilihan poli atau dokter.' });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [resource]);
 
   const startEdit = (record) => {
     setEditingId(record.id);
     setForm(Object.fromEntries(
       definition.fields.map((field) => [field.name, record[field.name] ?? (field.type === 'boolean' ? true : '')])
     ));
+    setFormModalOpen(true);
     setMessage({ type: '', text: '' });
+  };
+
+  const startCreate = () => {
+    setEditingId(null);
+    setForm(emptyForm(resource));
+    setFormModalOpen(true);
+    setMessage({ type: '', text: '' });
+  };
+
+  const closeFormModal = () => {
+    if (saving) return;
+    setFormModalOpen(false);
+    setEditingId(null);
+    setForm(emptyForm(resource));
   };
 
   const handleSave = async (event) => {
@@ -175,7 +224,9 @@ export default function AdminManagementPage({ resource }) {
       setMessage({ type: 'success', text: `${title} berhasil ${editingId ? 'diperbarui' : 'ditambahkan'}.` });
       setForm(emptyForm(resource));
       setEditingId(null);
-      await loadData();
+      setFormModalOpen(false);
+      setPage(1);
+      await loadData(1, debouncedSearch);
     } catch (err) {
       setMessage({ type: 'error', text: err.response?.data?.message || `Gagal menyimpan ${title.toLowerCase()}.` });
     } finally {
@@ -188,7 +239,9 @@ export default function AdminManagementPage({ resource }) {
     try {
       await yiiApi.delete(`/admin/${resource}/${record.id}`);
       setMessage({ type: 'success', text: `${title} berhasil dihapus.` });
-      await loadData();
+      const nextPage = records.length === 1 && page > 1 ? page - 1 : page;
+      setPage(nextPage);
+      await loadData(nextPage, debouncedSearch);
     } catch (err) {
       setMessage({ type: 'error', text: err.response?.data?.message || `Gagal menghapus ${title.toLowerCase()}.` });
     }
@@ -325,59 +378,134 @@ export default function AdminManagementPage({ resource }) {
         </div>
       )}
       <section className="rounded-xl border border-slate-200 bg-white p-5">
-        <h2 className="mb-4 text-lg font-bold text-slate-800">{editingId ? `Ubah ${title}` : `Tambah ${title}`}</h2>
-        <form onSubmit={handleSave} className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {definition.fields.map(renderField)}
-          <div className="flex items-end gap-2">
-            <button type="submit" disabled={saving} className="flex items-center gap-2 rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-60">
-              {editingId ? <Save size={16} /> : <Plus size={16} />}
-              {saving ? 'Menyimpan...' : editingId ? 'Simpan Perubahan' : 'Tambah Data'}
-            </button>
-            {editingId && (
-              <button type="button" onClick={() => { setEditingId(null); setForm(emptyForm(resource)); }} className="flex items-center gap-1 rounded-lg border px-3 py-2 text-sm">
-                <X size={15} /> Batal
-              </button>
-            )}
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-lg font-bold text-slate-800">{title}</h2>
+            <p className="mt-1 text-xs text-slate-500">{totalRecords.toLocaleString('id-ID')} data</p>
           </div>
-        </form>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <label className="relative">
+              <Search size={16} className="absolute left-3 top-2.5 text-slate-400" />
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setPage(1);
+                }}
+                placeholder={`Cari ${title.toLowerCase()}...`}
+                className="w-full rounded-lg border border-slate-300 py-2 pl-9 pr-3 text-sm sm:w-64"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={startCreate}
+              className="flex items-center justify-center gap-2 rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700"
+            >
+              <Plus size={16} /> Tambah {title}
+            </button>
+          </div>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-slate-50 text-slate-600">
+              <tr>
+                {definition.columns.map((column) => <th key={column} className="p-2.5">{column.split('.').pop().replaceAll('_', ' ')}</th>)}
+                <th className="p-2.5">Aksi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {records.map((record) => (
+                <tr key={record.id}>
+                  {definition.columns.map((column) => {
+                    const value = readValue(record, column);
+                    return <td key={column} className="p-2.5">{typeof value === 'boolean' ? (value ? 'Aktif' : 'Nonaktif') : value ?? '-'}</td>;
+                  })}
+                  <td className="p-2.5">
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => startEdit(record)} className="rounded p-1.5 text-blue-700 hover:bg-blue-50" aria-label={`Ubah ${title}`}>
+                        <Pencil size={16} />
+                      </button>
+                      <button type="button" onClick={() => handleDelete(record)} className="rounded p-1.5 text-red-700 hover:bg-red-50" aria-label={`Hapus ${title}`}>
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {loading && records.length === 0 && (
+                <tr><td colSpan={definition.columns.length + 1} className="p-6 text-center text-slate-500">Memuat data...</td></tr>
+              )}
+              {!loading && records.length === 0 && (
+                <tr><td colSpan={definition.columns.length + 1} className="p-6 text-center text-slate-500">Data tidak ditemukan.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 flex flex-col gap-3 border-t border-slate-100 pt-4 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-slate-500">
+            {totalRecords === 0 ? 'Belum ada data' : `Menampilkan ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalRecords)} dari ${totalRecords}`}
+          </p>
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+              disabled={page === 1 || loading}
+              className="flex items-center gap-1 rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
+            >
+              <ChevronLeft size={16} /> Sebelumnya
+            </button>
+            <span className="text-sm text-slate-600">Halaman {page} / {Math.max(1, Math.ceil(totalRecords / pageSize))}</span>
+            <button
+              type="button"
+              onClick={() => setPage((current) => current + 1)}
+              disabled={page >= Math.ceil(totalRecords / pageSize) || loading}
+              className="flex items-center gap-1 rounded-lg border px-3 py-2 text-sm disabled:opacity-50"
+            >
+              Berikutnya <ChevronRight size={16} />
+            </button>
+          </div>
+        </div>
       </section>
 
-      <section className="rounded-xl border border-slate-200 bg-white p-5">
-        <h2 className="mb-3 text-lg font-bold text-slate-800">{title}</h2>
-        {loading ? <p className="text-sm text-slate-500">Memuat data...</p> : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-slate-50 text-slate-600">
-                <tr>
-                  {definition.columns.map((column) => <th key={column} className="p-2.5">{column.split('.').pop().replaceAll('_', ' ')}</th>)}
-                  <th className="p-2.5">Aksi</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {records.map((record) => (
-                  <tr key={record.id}>
-                    {definition.columns.map((column) => {
-                      const value = readValue(record, column);
-                      return <td key={column} className="p-2.5">{typeof value === 'boolean' ? (value ? 'Aktif' : 'Nonaktif') : value ?? '-'}</td>;
-                    })}
-                    <td className="p-2.5">
-                      <div className="flex gap-2">
-                        <button type="button" onClick={() => startEdit(record)} className="rounded p-1.5 text-blue-700 hover:bg-blue-50" aria-label={`Ubah ${title}`}>
-                          <Pencil size={16} />
-                        </button>
-                        <button type="button" onClick={() => handleDelete(record)} className="rounded p-1.5 text-red-700 hover:bg-red-50" aria-label={`Hapus ${title}`}>
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-                {records.length === 0 && <tr><td colSpan={definition.columns.length + 1} className="p-4 text-center text-slate-500">Belum ada data.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+      {formModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) closeFormModal();
+        }}>
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="admin-form-title"
+            className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl bg-white shadow-xl"
+          >
+            <div className="sticky top-0 flex items-center justify-between border-b bg-white px-5 py-4">
+              <h2 id="admin-form-title" className="text-lg font-bold text-slate-800">
+                {editingId ? `Ubah ${title}` : `Tambah ${title}`}
+              </h2>
+              <button type="button" onClick={closeFormModal} disabled={saving} className="rounded p-1 text-slate-500 hover:bg-slate-100 disabled:opacity-50" aria-label="Tutup">
+                <X size={20} />
+              </button>
+            </div>
+            {message.type === 'error' && (
+              <div className="mx-5 mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                {message.text}
+              </div>
+            )}
+            <form onSubmit={handleSave} className="grid grid-cols-1 gap-4 p-5 sm:grid-cols-2">
+              {definition.fields.map(renderField)}
+              <div className="flex justify-end gap-2 border-t pt-4 sm:col-span-2">
+                <button type="button" onClick={closeFormModal} disabled={saving} className="rounded-lg border px-4 py-2 text-sm font-semibold text-slate-700 disabled:opacity-50">
+                  Batal
+                </button>
+                <button type="submit" disabled={saving} className="flex items-center gap-2 rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-60">
+                  {editingId ? <Save size={16} /> : <Plus size={16} />}
+                  {saving ? 'Menyimpan...' : editingId ? 'Simpan Perubahan' : 'Tambah Data'}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
     </div>
   );
 }
