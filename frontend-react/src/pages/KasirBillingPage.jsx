@@ -121,9 +121,20 @@ export default function KasirBillingPage() {
   };
 
   const handleDownloadPdf = async () => {
-    const res = await nodeApi.get(`/pdf/invoice/${selectedKunjunganId}`, { responseType: 'blob' });
-    const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }));
-    window.open(url, '_blank');
+    const invoiceWindow = window.open('about:blank', '_blank');
+    if (!invoiceWindow) {
+      setMsg('Browser memblokir jendela invoice. Izinkan pop-up untuk mencetak invoice.');
+      return;
+    }
+
+    try {
+      const res = await nodeApi.get(`/pdf/invoice/${selectedKunjunganId}`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: 'application/pdf' }));
+      invoiceWindow.location.href = url;
+    } catch (error) {
+      invoiceWindow.close();
+      setMsg(error.response?.data?.message || 'Invoice gagal dimuat. Silakan coba kembali.');
+    }
   };
 
   const formatRp = (v) => `Rp ${Number(v || 0).toLocaleString('id-ID')}`;

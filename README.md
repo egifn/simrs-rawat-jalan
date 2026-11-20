@@ -46,5 +46,9 @@ Endpoint konfigurasi hak akses adalah `GET /api/admin/permissions` dan `PUT /api
 
 1. **Database:** Buat database `simrs_rawat_jalan` di PostgreSQL dan jalankan `database/simrs_rawat_jalan.sql`.
 2. **Backend Yii2:** Masuk ke `backend-yii/`, sesuaikan `config/db.php`, jalankan `php yii migrate --interactive=0` untuk menerapkan migrasi permission, pasien aktif, idempotency, outbox, constraint stok, dan indeks, lalu jalankan `php yii serve --port=8000`.
-3. **Service Node.js:** Masuk ke `service-node/`, salin `.env`, set `SIMRS_LAB_WEBHOOK_SECRET` ke rahasia acak yang sama di environment PHP, lalu jalankan `npm install` dan `npm start` (berjalan di port `3001`). Konfigurasi `SIMRS_NODE_LAB_WEBHOOK_URL` pada environment PHP bila URL webhook berbeda dari alamat lokal default.
+3. **Service Node.js:** Masuk ke `service-node/`, salin `.env.example` menjadi `.env`, isi konfigurasi database lokal, set `JWT_SECRET` sama dengan Yii dan `SIMRS_LAB_WEBHOOK_SECRET` sama dengan environment PHP, lalu jalankan `npm install` dan `npm start` (berjalan di port `3001`). Konfigurasi `SIMRS_NODE_LAB_WEBHOOK_URL` pada environment PHP bila URL webhook berbeda dari alamat lokal default.
 4. **Frontend React:** Masuk ke `frontend-react/`, jalankan `npm install` dan `npm run dev`.
+
+## 6. Dokumen Pengumpulan
+
+Dokumentasi arsitektur, instalasi, API, keputusan teknis, test case, dan bukti tampilan ada di [`docs/pengumpulan/`](./docs/pengumpulan/README.md). Collection Postman untuk API lokal tersedia di `postman/SIMRS-Rawat-Jalan.postman_collection.json`; contoh environment tidak menyimpan token atau password.
